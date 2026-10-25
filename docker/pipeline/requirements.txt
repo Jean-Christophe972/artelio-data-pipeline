@@ -1,0 +1,5 @@
+psycopg[binary]==3.2.10
+confluent-kafka==2.11.1
+pydantic==2.11.9
+boto3==1.40.30
+prometheus-client==0.23.1

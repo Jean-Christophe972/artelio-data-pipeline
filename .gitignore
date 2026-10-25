@@ -1,0 +1,8 @@
+# Secrets générés par scripts/configure_env.sh : jamais versionnés
+.env
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+.DS_Store

@@ -1,0 +1,150 @@
+# Pipelines temps réel d'Artelio (bloc 3).
+# Se branche sur la plateforme du bloc 2 (réseaux artelio-backend / artelio-edge) :
+# PostgreSQL, Kafka, stockage objet et supervision y sont déjà déployés par Terraform.
+#
+#   ./scripts/configure_env.sh     # récupère les secrets de la plateforme → .env
+#   docker compose up -d --build
+name: artelio-pipeline
+
+x-pipeline-env: &pipeline-env
+  PG_HOST: pg-primary
+  PG_DATABASE: artelio
+  PG_USER: pipeline_etl
+  PG_PASSWORD: ${PG_ETL_PASSWORD:?lancer scripts/configure_env.sh}
+  KAFKA_BOOTSTRAP: kafka:9092
+  S3_ENDPOINT: http://object-storage:8333
+  S3_ACCESS_KEY: ${S3_PIPELINE_ACCESS:?lancer scripts/configure_env.sh}
+  S3_SECRET_KEY: ${S3_PIPELINE_SECRET:?lancer scripts/configure_env.sh}
+  PUSHGATEWAY: pushgateway:9091
+
+x-airflow: &airflow
+  build:
+    context: .
+    dockerfile: docker/airflow/Dockerfile
+  image: artelio-airflow:2.11.0
+  user: "50000:0"
+  environment:
+    <<: *pipeline-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD}@airflow-db/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: Europe/Paris
+    AIRFLOW__WEBSERVER__DEFAULT_UI_TIMEZONE: Europe/Paris
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "false"
+    AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "30"
+  volumes:
+    - ./dags:/opt/airflow/dags:ro
+    - ./sql:/opt/artelio/sql:ro
+    - airflow-logs:/opt/airflow/logs
+
+services:
+  # --- Migrations du schéma "pipeline" (une fois, avant le reste) ---------------
+  pipeline-init:
+    build: { context: ., dockerfile: docker/pipeline/Dockerfile }
+    image: artelio-pipeline:1.0.0
+    command: ["python", "-m", "artelio_pipeline.migrations"]
+    environment: *pipeline-env
+    networks: [backend]
+    restart: "no"
+
+  # --- Processeur de flux : 2 répliques dans le même groupe Kafka (redondance) ---
+  stream-processor:
+    image: artelio-pipeline:1.0.0
+    command: ["python", "-m", "artelio_pipeline.stream_processor"]
+    environment: *pipeline-env
+    networks: [backend]
+    restart: unless-stopped
+    deploy:
+      replicas: 2
+    depends_on:
+      pipeline-init: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/metrics', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    stop_grace_period: 20s
+
+  # --- Simulateur : remplace l'application mobile (débit réglable) ---------------
+  event-producer:
+    image: artelio-pipeline:1.0.0
+    command: ["python", "-m", "artelio_pipeline.simulateur", "--debit", "${DEBIT_EVENEMENTS:-20}", "--taux-erreur", "0.03"]
+    environment: *pipeline-env
+    networks: [backend]
+    restart: unless-stopped
+    depends_on:
+      pipeline-init: { condition: service_completed_successfully }
+
+  # --- Orchestration : Airflow ---------------------------------------------------
+  airflow-db:
+    image: postgres:16.10
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+      POSTGRES_DB: airflow
+    volumes: [airflow-db:/var/lib/postgresql/data]
+    networks: [airflow]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      retries: 6
+
+  airflow-init:
+    <<: *airflow
+    command:
+      - bash
+      - -c
+      - >
+        airflow db migrate &&
+        airflow users create --role Admin --username admin --password "$${AIRFLOW_ADMIN_PASSWORD}"
+        --firstname Equipe --lastname Data --email data@artelio.example.org || true
+    environment:
+      <<: *pipeline-env
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD}@airflow-db/airflow
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
+    networks: [airflow]
+    restart: "no"
+    depends_on:
+      airflow-db: { condition: service_healthy }
+
+  airflow-scheduler:
+    <<: *airflow
+    command: scheduler
+    networks: [airflow, backend]
+    restart: unless-stopped
+    depends_on:
+      airflow-init: { condition: service_completed_successfully }
+      pipeline-init: { condition: service_completed_successfully }
+
+  airflow-webserver:
+    <<: *airflow
+    command: webserver
+    ports: ["127.0.0.1:18080:8080"]
+    networks: [airflow, edge]
+    restart: unless-stopped
+    depends_on:
+      airflow-init: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+networks:
+  backend:
+    name: artelio-backend
+    external: true
+  edge:
+    name: artelio-edge
+    external: true
+  airflow:
+    internal: true
+
+volumes:
+  airflow-db:
+  airflow-logs:

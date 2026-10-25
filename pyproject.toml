@@ -1,0 +1,39 @@
+[project]
+name = "artelio-pipeline"
+version = "1.0.0"
+description = "Pipelines de données temps réel d'Artelio (bloc 3)"
+requires-python = ">=3.12"
+# Plages de versions (compatibles avec l'image Airflow) ; versions exactes : docker/pipeline/requirements.txt
+dependencies = [
+    "psycopg[binary]>=3.2",
+    "confluent-kafka>=2.5",
+    "pydantic>=2.6",
+    "boto3>=1.34",
+    "prometheus-client>=0.20",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.13"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["python"]
+
+[tool.pytest.ini_options]
+pythonpath = ["python", "dags"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 140
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "I", "N", "UP"]
+# N818 : nos exceptions portent des noms métier en français (EvenementInvalide, DatasetRefuse)
+ignore = ["N818"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["artelio_pipeline", "commun"]
